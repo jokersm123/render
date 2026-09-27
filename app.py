@@ -36,7 +36,7 @@ PAGE = """
 
             transform: translate(-50%, -50%);
 
-            width: 320px;
+            width: 220px;
             max-width: 70vw;
             height: auto;
         }
