@@ -1,3 +1,0 @@
-nicegui
-psycopg[binary]
-werkzeug
