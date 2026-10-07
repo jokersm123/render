@@ -1,12 +1,29 @@
 import asyncio
 import os
+import smtplib
+import ssl
+from email.message import EmailMessage
 
 import psycopg
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from nicegui import app, ui
 from werkzeug.security import generate_password_hash, check_password_hash
 
 DATABASE_URL = os.environ.get('DATABASE_URL', '')
 ALLOW_REGISTRATION = os.environ.get('ALLOW_REGISTRATION', 'true').lower() == 'true'
+
+STORAGE_SECRET = os.environ.get('STORAGE_SECRET', '')
+SITE_URL = os.environ.get('SITE_URL', 'https://shcherbakov.website').rstrip('/')
+
+SMTP_HOST = os.environ.get('SMTP_HOST', '')
+SMTP_PORT = int(os.environ.get('SMTP_PORT', '587'))
+SMTP_USER = os.environ.get('SMTP_USER', '')
+SMTP_PASSWORD = os.environ.get('SMTP_PASSWORD', '')
+SMTP_FROM = os.environ.get('SMTP_FROM', SMTP_USER)
+SMTP_STARTTLS = os.environ.get('SMTP_STARTTLS', 'true').lower() == 'true'
+SMTP_USE_SSL = os.environ.get('SMTP_USE_SSL', 'false').lower() == 'true'
+
+EMAIL_VERIFY_MAX_AGE = int(os.environ.get('EMAIL_VERIFY_MAX_AGE', '86400'))
 
 # =========================================================
 # HEAD + CSS
@@ -863,7 +880,7 @@ ui.add_head_html(
 
 
 # =========================================================
-# DATABASE / AUTH
+# DATABASE / AUTH / EMAIL VERIFICATION
 # =========================================================
 
 def db_connect():
@@ -874,7 +891,7 @@ def db_connect():
 
 
 def init_db():
-    """Create the users table and case-insensitive unique indexes."""
+    """Create or migrate the users table."""
     if not DATABASE_URL:
         print('WARNING: DATABASE_URL is not configured; authentication DB is unavailable.')
         return
@@ -888,10 +905,22 @@ def init_db():
                     email VARCHAR(255) NOT NULL,
                     password_hash TEXT NOT NULL,
                     is_admin BOOLEAN NOT NULL DEFAULT FALSE,
-                    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                    is_active BOOLEAN NOT NULL DEFAULT FALSE,
+                    email_verified_at TIMESTAMPTZ,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
+
+            # Safe migration from the previous version.
+            cur.execute("""
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ
+            """)
+            cur.execute("""
+                ALTER TABLE users
+                ALTER COLUMN is_active SET DEFAULT FALSE
+            """)
+
             cur.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_uq
                 ON users (LOWER(username))
@@ -914,7 +943,8 @@ def get_user(login):
                     email,
                     password_hash,
                     is_admin,
-                    is_active
+                    is_active,
+                    email_verified_at
                 FROM users
                 WHERE LOWER(username) = LOWER(%s)
                    OR LOWER(email) = LOWER(%s)
@@ -924,34 +954,192 @@ def get_user(login):
 
 
 def create_user(username, email, password):
-    """Create a user. The very first user becomes administrator."""
+    """Create an inactive user. Email confirmation activates the account."""
     with db_connect() as conn:
         with conn.cursor() as cur:
-            # Prevent two simultaneous "first registrations" from both becoming admin.
-            cur.execute("LOCK TABLE users IN EXCLUSIVE MODE")
-            cur.execute("SELECT COUNT(*) FROM users")
-            first_user = cur.fetchone()[0] == 0
-
             cur.execute("""
                 INSERT INTO users (
                     username,
                     email,
                     password_hash,
-                    is_admin
+                    is_admin,
+                    is_active
                 )
-                VALUES (%s, %s, %s, %s)
+                VALUES (%s, %s, %s, FALSE, FALSE)
                 RETURNING id
             """, (
                 username.strip(),
                 email.strip().lower(),
                 generate_password_hash(password),
-                first_user,
             ))
             user_id = cur.fetchone()[0]
+        conn.commit()
+    return user_id
+
+
+def make_email_verification_token(user_id, email):
+    if not STORAGE_SECRET:
+        raise RuntimeError('STORAGE_SECRET is not configured')
+
+    serializer = URLSafeTimedSerializer(
+        STORAGE_SECRET,
+        salt='rukopys-email-verification',
+    )
+    return serializer.dumps({
+        'user_id': int(user_id),
+        'email': email.strip().lower(),
+    })
+
+
+def read_email_verification_token(token):
+    if not STORAGE_SECRET:
+        raise RuntimeError('STORAGE_SECRET is not configured')
+
+    serializer = URLSafeTimedSerializer(
+        STORAGE_SECRET,
+        salt='rukopys-email-verification',
+    )
+    return serializer.loads(
+        token,
+        max_age=EMAIL_VERIFY_MAX_AGE,
+    )
+
+
+def send_verification_email(user_id, username, email):
+    """Send a confirmation link using SMTP configured in Render."""
+    if not SMTP_HOST or not SMTP_FROM:
+        raise RuntimeError(
+            'SMTP is not configured. Set SMTP_HOST, SMTP_PORT, '
+            'SMTP_FROM and, if required, SMTP_USER/SMTP_PASSWORD.'
+        )
+
+    token = make_email_verification_token(user_id, email)
+    verify_url = f'{SITE_URL}/verify-email/{token}'
+
+    message = EmailMessage()
+    message['Subject'] = 'Підтвердження реєстрації — Rukopys OCR'
+    message['From'] = SMTP_FROM
+    message['To'] = email
+
+    message.set_content(
+        f'Вітаємо, {username}!\n\n'
+        'Щоб завершити реєстрацію в Rukopys OCR, відкрийте посилання:\n\n'
+        f'{verify_url}\n\n'
+        f'Посилання дійсне {EMAIL_VERIFY_MAX_AGE // 3600} год.\n'
+        'Якщо ви не реєструвалися, просто проігноруйте цей лист.'
+    )
+
+    message.add_alternative(
+        f"""
+        <html>
+          <body style="font-family:Arial,sans-serif;color:#102443">
+            <h2>Rukopys OCR</h2>
+            <p>Вітаємо, <b>{username}</b>!</p>
+            <p>Щоб завершити реєстрацію, підтвердьте вашу email-адресу.</p>
+            <p style="margin:28px 0">
+              <a href="{verify_url}"
+                 style="background:#0876dc;color:white;text-decoration:none;
+                        padding:12px 20px;border-radius:8px;display:inline-block">
+                Підтвердити email
+              </a>
+            </p>
+            <p>Посилання дійсне {EMAIL_VERIFY_MAX_AGE // 3600} год.</p>
+            <p style="color:#7f8da3;font-size:13px">
+              Якщо ви не реєструвалися, просто проігноруйте цей лист.
+            </p>
+          </body>
+        </html>
+        """,
+        subtype='html',
+    )
+
+    context = ssl.create_default_context()
+
+    if SMTP_USE_SSL:
+        with smtplib.SMTP_SSL(
+            SMTP_HOST,
+            SMTP_PORT,
+            timeout=20,
+            context=context,
+        ) as smtp:
+            if SMTP_USER:
+                smtp.login(SMTP_USER, SMTP_PASSWORD)
+            smtp.send_message(message)
+    else:
+        with smtplib.SMTP(
+            SMTP_HOST,
+            SMTP_PORT,
+            timeout=20,
+        ) as smtp:
+            smtp.ehlo()
+            if SMTP_STARTTLS:
+                smtp.starttls(context=context)
+                smtp.ehlo()
+            if SMTP_USER:
+                smtp.login(SMTP_USER, SMTP_PASSWORD)
+            smtp.send_message(message)
+
+
+def activate_user_from_token(token):
+    """Verify token and activate the account. First verified user becomes admin."""
+    payload = read_email_verification_token(token)
+
+    user_id = int(payload['user_id'])
+    email = str(payload['email']).lower()
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            # Serialize first-admin assignment.
+            cur.execute('LOCK TABLE users IN EXCLUSIVE MODE')
+
+            cur.execute("""
+                SELECT id, username, email, is_active, is_admin
+                FROM users
+                WHERE id = %s AND LOWER(email) = LOWER(%s)
+                LIMIT 1
+            """, (user_id, email))
+            user = cur.fetchone()
+
+            if not user:
+                raise ValueError('Користувача не знайдено')
+
+            current_id, username, current_email, is_active, is_admin = user
+
+            if not is_active:
+                cur.execute("""
+                    SELECT EXISTS(
+                        SELECT 1
+                        FROM users
+                        WHERE is_admin = TRUE
+                          AND is_active = TRUE
+                    )
+                """)
+                admin_exists = cur.fetchone()[0]
+
+                make_admin = not admin_exists
+
+                cur.execute("""
+                    UPDATE users
+                    SET
+                        is_active = TRUE,
+                        email_verified_at = NOW(),
+                        is_admin = CASE
+                            WHEN %s THEN TRUE
+                            ELSE is_admin
+                        END
+                    WHERE id = %s
+                    RETURNING is_admin
+                """, (make_admin, current_id))
+                is_admin = cur.fetchone()[0]
 
         conn.commit()
 
-    return user_id, first_user
+    return {
+        'user_id': current_id,
+        'username': username,
+        'email': current_email,
+        'is_admin': is_admin,
+    }
 
 
 def require_login():
@@ -1018,10 +1206,25 @@ def login_page():
             ui.notify('Невірний логін або пароль', type='negative')
             return
 
-        user_id, username, email, password_hash, is_admin, is_active = user
+        (
+            user_id,
+            username,
+            email,
+            password_hash,
+            is_admin,
+            is_active,
+            email_verified_at,
+        ) = user
 
-        if not is_active or not check_password_hash(password_hash, password):
+        if not check_password_hash(password_hash, password):
             ui.notify('Невірний логін або пароль', type='negative')
+            return
+
+        if not is_active:
+            ui.notify(
+                'Email ще не підтверджено. Перевірте пошту або надішліть лист повторно.',
+                type='warning',
+            )
             return
 
         app.storage.user.update({
@@ -1032,6 +1235,58 @@ def login_page():
         })
 
         ui.navigate.to('/')
+
+    async def resend_confirmation():
+        login = (login_input.value or '').strip()
+        password = password_input.value or ''
+
+        if not login or not password:
+            ui.notify(
+                'Введіть логін/email і пароль, потім повторіть відправлення',
+                type='warning',
+            )
+            return
+
+        try:
+            user = get_user(login)
+            if not user:
+                ui.notify('Невірний логін або пароль', type='negative')
+                return
+
+            (
+                user_id,
+                username,
+                email,
+                password_hash,
+                is_admin,
+                is_active,
+                email_verified_at,
+            ) = user
+
+            if not check_password_hash(password_hash, password):
+                ui.notify('Невірний логін або пароль', type='negative')
+                return
+
+            if is_active:
+                ui.notify('Email вже підтверджено', type='positive')
+                return
+
+            await asyncio.to_thread(
+                send_verification_email,
+                user_id,
+                username,
+                email,
+            )
+
+            ui.notify(
+                'Лист підтвердження надіслано повторно',
+                type='positive',
+            )
+        except Exception as exc:
+            ui.notify(
+                f'Не вдалося надіслати лист: {exc}',
+                type='negative',
+            )
 
     with ui.column().classes(
         'auth-shell w-full items-center justify-center px-5'
@@ -1090,6 +1345,16 @@ def login_page():
                 'auth-btn w-full'
             )
 
+            ui.button(
+                'Надіслати підтвердження повторно',
+                icon='mail',
+                on_click=resend_confirmation,
+            ).props(
+                'flat'
+            ).classes(
+                'w-full'
+            )
+
             if ALLOW_REGISTRATION:
                 ui.button(
                     'Реєстрація',
@@ -1128,24 +1393,15 @@ def register_page():
             return
 
         if len(username) > 80:
-            ui.notify(
-                'Логін занадто довгий',
-                type='warning',
-            )
+            ui.notify('Логін занадто довгий', type='warning')
             return
 
         if '@' not in email or '.' not in email.split('@')[-1]:
-            ui.notify(
-                'Вкажіть коректний email',
-                type='warning',
-            )
+            ui.notify('Вкажіть коректний email', type='warning')
             return
 
         if len(email) > 255:
-            ui.notify(
-                'Email занадто довгий',
-                type='warning',
-            )
+            ui.notify('Email занадто довгий', type='warning')
             return
 
         if len(password) < 8:
@@ -1156,18 +1412,23 @@ def register_page():
             return
 
         if password != password2:
-            ui.notify(
-                'Паролі не збігаються',
-                type='warning',
-            )
+            ui.notify('Паролі не збігаються', type='warning')
             return
 
         try:
-            user_id, is_admin = create_user(
+            user_id = create_user(
                 username,
                 email,
                 password,
             )
+
+            await asyncio.to_thread(
+                send_verification_email,
+                user_id,
+                username,
+                email,
+            )
+
         except psycopg.errors.UniqueViolation:
             ui.notify(
                 'Такий логін або email вже існує',
@@ -1176,19 +1437,16 @@ def register_page():
             return
         except Exception as exc:
             ui.notify(
-                f'Помилка бази даних: {exc}',
+                f'Реєстрацію створено, але лист не надіслано: {exc}',
                 type='negative',
             )
             return
 
-        app.storage.user.update({
-            'user_id': user_id,
-            'username': username,
-            'email': email.lower(),
-            'is_admin': is_admin,
-        })
-
-        ui.navigate.to('/')
+        ui.notify(
+            'Реєстрацію створено. Перевірте email та підтвердьте адресу.',
+            type='positive',
+        )
+        ui.navigate.to('/login')
 
     with ui.column().classes(
         'auth-shell w-full items-center justify-center px-5'
@@ -1209,7 +1467,7 @@ def register_page():
             )
 
             ui.label(
-                'Створення облікового запису'
+                'Після реєстрації ми надішлемо лист для підтвердження email'
             ).classes(
                 'text-gray-500 w-full text-center mb-3'
             )
@@ -1268,11 +1526,80 @@ def register_page():
             )
 
 
+@ui.page('/verify-email/{token}')
+def verify_email_page(token: str):
+    auth_page_style()
+
+    status = {
+        'ok': False,
+        'title': 'Підтвердження email',
+        'message': '',
+    }
+
+    try:
+        user = activate_user_from_token(token)
+
+        app.storage.user.update({
+            'user_id': user['user_id'],
+            'username': user['username'],
+            'email': user['email'],
+            'is_admin': user['is_admin'],
+        })
+
+        status['ok'] = True
+        status['title'] = 'Email підтверджено'
+        status['message'] = (
+            'Реєстрацію завершено. Тепер ви можете користуватися Rukopys OCR.'
+        )
+
+    except SignatureExpired:
+        status['message'] = (
+            'Термін дії посилання минув. '
+            'Поверніться на сторінку входу та надішліть підтвердження повторно.'
+        )
+    except BadSignature:
+        status['message'] = 'Посилання підтвердження недійсне.'
+    except Exception as exc:
+        status['message'] = f'Не вдалося підтвердити email: {exc}'
+
+    with ui.column().classes(
+        'auth-shell w-full items-center justify-center px-5'
+    ):
+        with ui.column().classes('auth-card gap-4 items-center'):
+
+            ui.icon(
+                'verified' if status['ok'] else 'error',
+                size='54px',
+            ).classes(
+                'text-green-600' if status['ok'] else 'text-red-500'
+            )
+
+            ui.label(
+                status['title']
+            ).classes(
+                'text-3xl font-bold text-center'
+            )
+
+            ui.label(
+                status['message']
+            ).classes(
+                'text-gray-500 text-center'
+            )
+
+            ui.button(
+                'Перейти до системи' if status['ok'] else 'Повернутися до входу',
+                on_click=lambda: ui.navigate.to(
+                    '/' if status['ok'] else '/login'
+                ),
+            ).classes(
+                'auth-btn w-full mt-2'
+            )
+
+
 @ui.page('/logout')
 def logout_page():
     app.storage.user.clear()
     ui.navigate.to('/login')
-
 
 
 # =========================================================
@@ -1812,8 +2139,5 @@ ui.run(
     port=int(os.environ.get('PORT', '8080')),
     title='Rukopys OCR',
     favicon='📄',
-    storage_secret=os.environ.get(
-        'STORAGE_SECRET',
-        'CHANGE-ME-IN-RENDER',
-    ),
+    storage_secret=STORAGE_SECRET or 'CHANGE-ME-IN-RENDER',
 )
